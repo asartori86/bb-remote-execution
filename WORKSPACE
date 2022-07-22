@@ -39,6 +39,11 @@ http_archive(
     ],
 )
 
+local_repository(
+    name = "com_github_buildbarn_bb_storage",
+    path = "../bb-storage",
+)
+
 # gazelle:repository_macro go_dependencies.bzl%go_dependencies
 load(":go_dependencies.bzl", "go_dependencies")
 

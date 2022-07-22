@@ -34,6 +34,8 @@ require (
 	google.golang.org/protobuf v1.28.0
 )
 
+replace github.com/buildbarn/bb-storage => ../bb-storage
+
 require (
 	cloud.google.com/go v0.65.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.4.2 // indirect
