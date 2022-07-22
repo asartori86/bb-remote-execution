@@ -11,6 +11,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/util"
 
+	"github.com/buildbarn/bb-storage/pkg/justbuild"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -32,14 +33,6 @@ func NewBlobAccessDirectoryFetcher(blobAccess blobstore.BlobAccess, maximumMessa
 	}
 }
 
-func (df *blobAccessDirectoryFetcher) GetDirectory(ctx context.Context, directoryDigest digest.Digest) (*remoteexecution.Directory, error) {
-	m, err := df.blobAccess.Get(ctx, directoryDigest).ToProto(&remoteexecution.Directory{}, df.slicer.maximumMessageSizeBytes)
-	if err != nil {
-		return nil, err
-	}
-	return m.(*remoteexecution.Directory), nil
-}
-
 func (df *blobAccessDirectoryFetcher) GetTreeRootDirectory(ctx context.Context, treeDigest digest.Digest) (*remoteexecution.Directory, error) {
 	m, err := df.blobAccess.Get(ctx, treeDigest).ToProto(&remoteexecution.Tree{}, df.slicer.maximumMessageSizeBytes)
 	if err != nil {
@@ -54,6 +47,28 @@ func (df *blobAccessDirectoryFetcher) GetTreeRootDirectory(ctx context.Context, 
 
 func (df *blobAccessDirectoryFetcher) GetTreeChildDirectory(ctx context.Context, treeDigest, childDigest digest.Digest) (*remoteexecution.Directory, error) {
 	m, err := df.blobAccess.GetFromComposite(ctx, treeDigest, childDigest, &df.slicer).ToProto(&remoteexecution.Directory{}, df.slicer.maximumMessageSizeBytes)
+	if err != nil {
+		return nil, err
+	}
+	return m.(*remoteexecution.Directory), nil
+}
+
+func (df *blobAccessDirectoryFetcher) GetDirectory(ctx context.Context, digest digest.Digest) (*remoteexecution.Directory, error) {
+	x := df.blobAccess.Get(ctx, digest)
+	is_just := digest.NewHasher().Size() == justbuild.NewBlobHasher().Size()
+	if is_just {
+		data, err := x.ToByteSlice(df.maximumMessageSizeBytes)
+		if err != nil {
+			return nil, err
+		}
+		m, err := justbuild.ToDirectoryMessage(data)
+		if err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+
+	m, err := x.ToProto(&remoteexecution.Directory{}, df.maximumMessageSizeBytes)
 	if err != nil {
 		return nil, err
 	}

@@ -22,6 +22,7 @@ go_library(
         "@com_github_buildbarn_bb_storage//pkg/blobstore/buffer",
         "@com_github_buildbarn_bb_storage//pkg/blobstore/slicing",
         "@com_github_buildbarn_bb_storage//pkg/digest",
+        "@com_github_buildbarn_bb_storage//pkg/justbuild",
         "@com_github_buildbarn_bb_storage//pkg/eviction",
         "@com_github_buildbarn_bb_storage//pkg/filesystem",
         "@com_github_buildbarn_bb_storage//pkg/filesystem/path",

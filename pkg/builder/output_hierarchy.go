@@ -2,14 +2,18 @@ package builder
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"sort"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/filesystem"
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
+	"github.com/buildbarn/bb-storage/pkg/justbuild"
 	"github.com/buildbarn/bb-storage/pkg/util"
 
 	"google.golang.org/grpc/codes"
@@ -38,6 +42,15 @@ func (on *outputNode) getSubdirectoryNames() []path.Component {
 func sortToUpload(m map[path.Component][]string) []path.Component {
 	l := make(path.ComponentsList, 0, len(m))
 	for k := range m {
+		l = append(l, k)
+	}
+	sort.Sort(l)
+	return l
+}
+
+func sortFiles(m []filesystem.FileInfo) []filesystem.FileInfo {
+	l := make(filesystem.FileInfoList, 0, len(m))
+	for _, k := range m {
 		l = append(l, k)
 	}
 	sort.Sort(l)
@@ -188,6 +201,7 @@ type uploadOutputsState struct {
 	contentAddressableStorage blobstore.BlobAccess
 	digestFunction            digest.Function
 	actionResult              *remoteexecution.ActionResult
+	treeDigestFunction        digest.Function
 
 	firstError error
 }
@@ -201,16 +215,38 @@ func (s *uploadOutputsState) saveError(err error) {
 	}
 }
 
+func gitFileMod(isexecutable bool) uint {
+	if isexecutable {
+		return 0o100755
+	}
+	return 0o100644
+}
+
+// remove tag
+func postProcessHash(hash string, f digest.Function) []byte {
+	if f.GetHasherFactory().Size() == justbuild.NewBlobHasher().Size() {
+		hash = hash[2:]
+	}
+	x, _ := hex.DecodeString(hash)
+	return x
+}
+
 // UploadDirectory is called to upload a single directory. Elements in
 // the directory are stored in a remoteexecution.Directory, so that they
 // can be placed in a remoteexecution.Tree.
-func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.Trace, children map[digest.Digest]*remoteexecution.Directory) *remoteexecution.Directory {
+func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.Trace, children map[digest.Digest]*remoteexecution.Directory) (*remoteexecution.Directory, *digest.Digest) {
 	files, err := d.ReadDir()
 	if err != nil {
 		s.saveError(util.StatusWrapf(err, "Failed to read output directory %#v", dPath.String()))
-		return &remoteexecution.Directory{}
+		return &remoteexecution.Directory{}, nil
 	}
 
+	entries := []byte{}
+	is_just := s.digestFunction.GetHasherFactory().Size() == justbuild.Size
+	if is_just {
+		// git requires sorted entries
+		files = sortFiles(files)
+	}
 	var directory remoteexecution.Directory
 	for _, file := range files {
 		name := file.Name()
@@ -218,6 +254,13 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 		switch fileType := file.Type(); fileType {
 		case filesystem.FileTypeRegularFile:
 			if childDigest, err := d.UploadFile(s.context, name, s.digestFunction); err == nil {
+				if is_just {
+					hash := childDigest.GetHashString()
+					entries = append(entries, []byte(fmt.Sprintf("%o %s\x00", gitFileMod(file.IsExecutable()), name.String()))...)
+					entries = append(entries, postProcessHash(hash, s.digestFunction)...)
+					continue
+				}
+
 				directory.Files = append(directory.Files, &remoteexecution.FileNode{
 					Name:         name.String(),
 					Digest:       childDigest.GetProto(),
@@ -228,12 +271,17 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 			}
 		case filesystem.FileTypeDirectory:
 			if childDirectory, err := d.EnterUploadableDirectory(name); err == nil {
-				child := s.uploadDirectory(childDirectory, dPath, children)
+				// this must return the tree hash
+				child, git_tree_id := s.uploadDirectory(childDirectory, dPath, children)
 				childDirectory.Close()
-
+				if is_just {
+					entries = append(entries, []byte(fmt.Sprintf("%o %s\x00", 0o40000, name.String()))...)
+					entries = append(entries, postProcessHash(git_tree_id.GetHashString(), s.treeDigestFunction)...)
+					continue
+				}
 				// Compute digest of the child directory. This requires serializing it.
 				if data, err := proto.Marshal(child); err == nil {
-					digestGenerator := s.digestFunction.NewGenerator()
+					digestGenerator := s.treeDigestFunction.NewGenerator()
 					if _, err := digestGenerator.Write(data); err == nil {
 						childDigest := digestGenerator.Sum()
 						children[childDigest] = child
@@ -252,6 +300,9 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 			}
 		case filesystem.FileTypeSymlink:
 			if target, err := d.Readlink(name); err == nil {
+				if is_just {
+					panic("justbuild does not support symlinks yet.")
+				}
 				directory.Symlinks = append(directory.Symlinks, &remoteexecution.SymlinkNode{
 					Name:   name.String(),
 					Target: target,
@@ -261,7 +312,22 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 			}
 		}
 	}
-	return &directory
+
+	if is_just {
+		// store the git tree into the CAS
+		dg := s.treeDigestFunction.NewGenerator()
+		dg.Write(entries)
+		tree_id := dg.Sum()
+		x := buffer.NewCASBufferFromByteSlice(tree_id, entries, buffer.BackendProvided(func(dataIsValid bool) {
+			if !dataIsValid {
+				fmt.Printf("Could not store git tree %s\n", tree_id.GetHashString())
+			}
+		}))
+
+		s.contentAddressableStorage.Put(s.context, tree_id, x)
+		return nil, &tree_id
+	}
+	return &directory, nil
 }
 
 // UploadOutputDirectoryEntered is called to upload a single output
@@ -269,8 +335,18 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 // already be opened.
 func (s *uploadOutputsState) uploadOutputDirectoryEntered(d UploadableDirectory, dPath *path.Trace, paths []string) {
 	children := map[digest.Digest]*remoteexecution.Directory{}
+	root, git_tree := s.uploadDirectory(d, dPath, children)
+	if git_tree != nil {
+		s.actionResult.OutputDirectories = append(
+			s.actionResult.OutputDirectories,
+			&remoteexecution.OutputDirectory{
+				Path:       paths[0],
+				TreeDigest: git_tree.GetProto(),
+			})
+		return
+	}
 	tree := &remoteexecution.Tree{
-		Root: s.uploadDirectory(d, dPath, children),
+		Root: root,
 	}
 
 	childDigests := digest.NewSetBuilder()
@@ -281,7 +357,7 @@ func (s *uploadOutputsState) uploadOutputDirectoryEntered(d UploadableDirectory,
 		tree.Children = append(tree.Children, children[childDigest])
 	}
 
-	if treeDigest, err := blobstore.CASPutProto(s.context, s.contentAddressableStorage, tree, s.digestFunction); err == nil {
+	if treeDigest, err := blobstore.CASPutProto(s.context, s.contentAddressableStorage, tree, s.treeDigestFunction); err == nil {
 		for _, path := range paths {
 			s.actionResult.OutputDirectories = append(
 				s.actionResult.OutputDirectories,
@@ -483,11 +559,17 @@ func (oh *OutputHierarchy) CreateParentDirectories(d ParentPopulatableDirectory)
 // UploadOutputs uploads outputs of the build action into the CAS. This
 // function is called after executing the build action.
 func (oh *OutputHierarchy) UploadOutputs(ctx context.Context, d UploadableDirectory, contentAddressableStorage blobstore.BlobAccess, digestFunction digest.Function, actionResult *remoteexecution.ActionResult) error {
+	is_just := digestFunction.NewGenerator().GetSize() == justbuild.NewBlobHasher().Size()
 	s := uploadOutputsState{
 		context:                   ctx,
 		contentAddressableStorage: contentAddressableStorage,
 		digestFunction:            digestFunction,
 		actionResult:              actionResult,
+		treeDigestFunction:        digestFunction,
+	}
+	if is_just {
+		s.digestFunction = digestFunction.ChangeHasherFactory(justbuild.NewBlobHasher)
+		s.treeDigestFunction = digestFunction.ChangeHasherFactory(justbuild.NewTreeHasher)
 	}
 
 	if len(oh.rootsToUpload) > 0 {
