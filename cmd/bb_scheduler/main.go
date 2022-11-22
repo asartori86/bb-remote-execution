@@ -20,6 +20,7 @@ import (
 	"github.com/buildbarn/bb-remote-execution/pkg/scheduler/routing"
 	"github.com/buildbarn/bb-storage/pkg/auth"
 	blobstore_configuration "github.com/buildbarn/bb-storage/pkg/blobstore/configuration"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/multigeneration"
 	"github.com/buildbarn/bb-storage/pkg/capabilities"
 	"github.com/buildbarn/bb-storage/pkg/clock"
 	"github.com/buildbarn/bb-storage/pkg/cloud/aws"
@@ -63,6 +64,13 @@ func main() {
 			int(configuration.MaximumMessageSizeBytes)))
 	if err != nil {
 		log.Fatal("Failed to create Content Adddressable Storage: ", err)
+	}
+
+	// If ShardedMultiGenerationBlobAccess is used as backend for the
+	// CAS, we spawn a controller to coordinate the rotations
+	_, err = multigeneration.NewShardedMultiGenerationControllerFromConfiguration(configuration.ContentAddressableStorage, grpcClientFactory)
+	if err != nil {
+		log.Fatal("Failed to create controller for ShardedMultiGenerationBlobAccess: ", err)
 	}
 	contentAddressableStorage := re_blobstore.NewExistencePreconditionBlobAccess(info.BlobAccess)
 
@@ -154,7 +162,6 @@ func main() {
 			log.Fatal("Failed to register predeclared platform queue: ", err)
 		}
 	}
-
 	// Spawn gRPC servers for client and worker traffic.
 	go func() {
 		log.Fatal(
