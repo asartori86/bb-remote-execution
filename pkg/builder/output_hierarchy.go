@@ -48,8 +48,12 @@ func sortToUpload(m map[path.Component][]string) []path.Component {
 	return l
 }
 
-func sortFiles(m []filesystem.FileInfo) []filesystem.FileInfo {
-	l := make(filesystem.FileInfoList, 0, len(m))
+// git sorts directory names as if they have a trailing "/"
+// so, according to git, this is the correct ordering
+// foo.txt (blob)
+// foo     (tree)
+func sortGitFiles(m []filesystem.FileInfo) []filesystem.FileInfo {
+	l := make(filesystem.GitFileInfoList, 0, len(m))
 	for _, k := range m {
 		l = append(l, k)
 	}
@@ -244,8 +248,8 @@ func (s *uploadOutputsState) uploadDirectory(d UploadableDirectory, dPath *path.
 	entries := []byte{}
 	is_just := s.digestFunction.GetHasherFactory().Size() == justbuild.Size
 	if is_just {
-		// git requires sorted entries
-		files = sortFiles(files)
+		// git requires entries sorted in a peculiar way...
+		files = sortGitFiles(files)
 	}
 	var directory remoteexecution.Directory
 	for _, file := range files {
