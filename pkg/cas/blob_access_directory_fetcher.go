@@ -9,6 +9,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/slicing"
 	"github.com/buildbarn/bb-storage/pkg/digest"
+	"github.com/buildbarn/bb-storage/pkg/justbuild"
 	"github.com/buildbarn/bb-storage/pkg/util"
 
 	"google.golang.org/grpc/codes"
@@ -35,7 +36,19 @@ func NewBlobAccessDirectoryFetcher(blobAccess blobstore.BlobAccess, maximumDirec
 }
 
 func (df *blobAccessDirectoryFetcher) GetDirectory(ctx context.Context, directoryDigest digest.Digest) (*remoteexecution.Directory, error) {
-	m, err := df.blobAccess.Get(ctx, directoryDigest).ToProto(&remoteexecution.Directory{}, df.slicer.maximumDirectorySizeBytes)
+	x := df.blobAccess.Get(ctx, directoryDigest)
+	if directoryDigest.GetDigestFunction().GetEnumValue() == remoteexecution.DigestFunction_GITSHA1 {
+		data, err := x.ToByteSlice(df.slicer.maximumDirectorySizeBytes)
+		if err != nil {
+			return nil, err
+		}
+		m, err := justbuild.ToDirectoryMessage(data)
+		if err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+	m, err := x.ToProto(&remoteexecution.Directory{}, df.slicer.maximumDirectorySizeBytes)
 	if err != nil {
 		return nil, err
 	}

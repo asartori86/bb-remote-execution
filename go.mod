@@ -36,6 +36,8 @@ require (
 	google.golang.org/protobuf v1.30.0
 )
 
+replace github.com/buildbarn/bb-storage => ../bb-storage
+
 require (
 	cloud.google.com/go v0.110.0 // indirect
 	cloud.google.com/go/compute v1.18.0 // indirect

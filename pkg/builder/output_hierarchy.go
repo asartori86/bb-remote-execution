@@ -2,6 +2,8 @@ package builder
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"sort"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/filesystem"
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
+	"github.com/buildbarn/bb-storage/pkg/justbuild"
 	"github.com/buildbarn/bb-storage/pkg/util"
 
 	"google.golang.org/grpc/codes"
@@ -40,6 +43,19 @@ func (on *outputNode) getSubdirectoryNames() []path.Component {
 func sortToUpload(m map[path.Component][]string) []path.Component {
 	l := make(path.ComponentsList, 0, len(m))
 	for k := range m {
+		l = append(l, k)
+	}
+	sort.Sort(l)
+	return l
+}
+
+// git sorts directory names as if they have a trailing "/"
+// so, according to git, this is the correct ordering
+// foo.txt (blob)
+// foo     (tree)
+func sortGitFiles(m []filesystem.FileInfo) []filesystem.FileInfo {
+	l := make(filesystem.GitFileInfoList, 0, len(m))
+	for _, k := range m {
 		l = append(l, k)
 	}
 	sort.Sort(l)
@@ -211,7 +227,16 @@ func (s *uploadOutputsState) uploadOutputDirectoryEntered(d UploadableDirectory,
 		uploadOutputsState: s,
 		directoriesSeen:    map[digest.Digest]struct{}{},
 	}
-	if rootDirectory, err := dState.uploadDirectory(d, dPath); err == nil {
+	if rootDirectory, err, gitTree := dState.uploadDirectory(d, dPath); err == nil {
+		if gitTree != nil {
+			s.actionResult.OutputDirectories = append(
+				s.actionResult.OutputDirectories,
+				&remoteexecution.OutputDirectory{
+					Path:       paths[0],
+					TreeDigest: gitTree.GetProto(),
+				})
+			return
+		}
 		// Approximate the size of the resulting Tree object, so
 		// that we may allocate all space at once.
 		directories := append(dState.directories, rootDirectory)
@@ -313,15 +338,35 @@ type uploadOutputDirectoryState struct {
 	directoriesSeen map[digest.Digest]struct{}
 }
 
-// UploadDirectory is called to upload a single directory. Elements in
-// the directory are stored in a remoteexecution.Directory, so that they
-// can be placed in a remoteexecution.Tree.
-func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPath *path.Trace) ([]byte, error) {
+// Utility function for generating the content of a git tree
+func gitFileMod(isExecutable bool) uint {
+	if isExecutable {
+		return 0o100755
+	}
+	return 0o100644
+}
+
+// Remove justbuild tag
+func untagHash(bytes []byte) []byte {
+	return bytes[justbuild.MarkerSizeBytes:]
+}
+
+// UploadDirectory is called to upload a single directory. Elements in the
+// directory are stored in a remoteexecution.Directory, so that they can be
+// placed in a remoteexecution.Tree.
+//
+// If the GITSHA1 DigestFunction is used, it will return the digest of the
+// corresponding git tree
+func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPath *path.Trace) ([]byte, error, *digest.Digest) {
 	files, err := d.ReadDir()
 	if err != nil {
-		return nil, util.StatusWrapf(err, "Failed to read output directory %#v", dPath.String())
+		return nil, util.StatusWrapf(err, "Failed to read output directory %#v", dPath.String()), nil
 	}
-
+	useGITSHA1 := s.digestFunction.GetEnumValue() == remoteexecution.DigestFunction_GITSHA1
+	entries := []byte{}
+	if useGITSHA1 {
+		files = sortGitFiles(files)
+	}
 	var directory remoteexecution.Directory
 	for _, file := range files {
 		name := file.Name()
@@ -329,6 +374,12 @@ func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPat
 		switch fileType := file.Type(); fileType {
 		case filesystem.FileTypeRegularFile:
 			if childDigest, err := d.UploadFile(s.context, name, s.digestFunction); err == nil {
+				if useGITSHA1 {
+					// Build up the git tree content
+					entries = append(entries, []byte(fmt.Sprintf("%o %s\x00%s", gitFileMod(file.IsExecutable()), name.String(), untagHash(childDigest.GetHashBytes())))...)
+					continue
+				}
+
 				directory.Files = append(directory.Files, &remoteexecution.FileNode{
 					Name:         name.String(),
 					Digest:       childDigest.GetProto(),
@@ -339,9 +390,14 @@ func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPat
 			}
 		case filesystem.FileTypeDirectory:
 			if childDirectory, err := d.EnterUploadableDirectory(name); err == nil {
-				childData, err := s.uploadDirectory(childDirectory, dPath)
+				childData, err, treeDigest := s.uploadDirectory(childDirectory, dPath)
 				childDirectory.Close()
 				if err == nil {
+					if useGITSHA1 {
+						// Build up the git tree content
+						entries = append(entries, []byte(fmt.Sprintf("%o %s\x00%s", 0o40000, name.String(), untagHash(treeDigest.GetHashBytes())))...)
+						continue
+					}
 					// Compute the digest of the child
 					// directory, so that it may be
 					// referenced by the parent.
@@ -381,12 +437,32 @@ func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPat
 			}
 		}
 	}
+	if useGITSHA1 {
+		// Add the git tree to CAS, if not known already
+		dg := justbuild.NewTreeHasher()
+		dg.Write(entries)
+		treeId := dg.Sum(nil)
+		treeDigest := digest.MustNewDigest(s.digestFunction.GetInstanceName().String(), remoteexecution.DigestFunction_GITSHA1, hex.EncodeToString(treeId), int64(len(entries)))
+		missing, err := s.contentAddressableStorage.FindMissing(s.context, treeDigest.ToSingletonSet())
+		if err != nil {
+			return nil, util.StatusWrapf(err, "Failed to call FindMissing on digest %#v", treeDigest), nil
+		}
+		if !missing.Empty() {
+			x := buffer.NewCASBufferFromByteSlice(treeDigest, entries, buffer.BackendProvided(func(dataIsValid bool) {
+				if !dataIsValid {
+					fmt.Printf("Could create buffer for git tree %#v\n", treeDigest)
+				}
+			}))
 
+			s.contentAddressableStorage.Put(s.context, treeDigest, x)
+		}
+		return nil, nil, &treeDigest
+	}
 	data, err := proto.Marshal(&directory)
 	if err != nil {
-		return nil, util.StatusWrapf(err, "Failed to marshal output directory %#v", dPath.String())
+		return nil, util.StatusWrapf(err, "Failed to marshal output directory %#v", dPath.String()), nil
 	}
-	return data, nil
+	return data, nil, nil
 }
 
 // outputNodePath is an implementation of path.ComponentWalker that is
