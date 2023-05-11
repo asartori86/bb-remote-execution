@@ -7,6 +7,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/digest"
+	"github.com/buildbarn/bb-storage/pkg/justbuild"
 	"github.com/buildbarn/bb-storage/pkg/util"
 
 	"golang.org/x/sync/errgroup"
@@ -114,8 +115,8 @@ func (ba *batchedStoreBlobAccess) Put(ctx context.Context, digest digest.Digest,
 		return nil
 	}
 
-	// Flush the existing blobs if there are too many pending.
-	if len(ba.pendingPutOperations) >= ba.batchSize {
+	// Flush the existing blobs if there are too many pending or we want to upload a gitsha1 tree.
+	if len(ba.pendingPutOperations) >= ba.batchSize || justbuild.IsJustbuildTree(digest.GetHashString()) {
 		ba.flushLocked(ctx)
 	}
 	if err := ba.flushError; err != nil {
