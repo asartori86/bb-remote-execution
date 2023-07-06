@@ -2,6 +2,8 @@ package cas
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"io"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -35,6 +37,59 @@ func NewBlobAccessDirectoryFetcher(blobAccess blobstore.BlobAccess, maximumDirec
 	}
 }
 
+func (df *blobAccessDirectoryFetcher) toDirectoryMessage(ctx context.Context, entries []byte) (*remoteexecution.Directory, error) {
+	var directory remoteexecution.Directory
+	if len(entries) == 0 {
+		return &directory, nil
+	}
+	hashes, types, names, err := justbuild.GetTaggedHashes(entries)
+	if err != nil {
+		return nil, err
+	}
+	for i, hash := range hashes {
+		blobType := types[i]
+		name := names[i]
+		if blobType == justbuild.Tree {
+			directory.Directories = append(directory.Directories,
+				&remoteexecution.DirectoryNode{
+					Name:   name,
+					Digest: &remoteexecution.Digest{Hash: hash},
+				})
+		} else if blobType == justbuild.ExecutableFile {
+			directory.Files = append(directory.Files, &remoteexecution.FileNode{
+				Name:         name,
+				Digest:       &remoteexecution.Digest{Hash: hash},
+				IsExecutable: true,
+			})
+		} else if blobType == justbuild.RegularFile {
+			directory.Files = append(directory.Files, &remoteexecution.FileNode{
+				Name:         name,
+				Digest:       &remoteexecution.Digest{Hash: hash},
+				IsExecutable: false,
+			})
+
+		} else if blobType == justbuild.Symlink {
+			dgst := digest.MustNewDigest("", remoteexecution.DigestFunction_GITSHA1, hash, 0)
+			buf := df.blobAccess.Get(ctx, dgst)
+			s, err := buf.GetSizeBytes()
+			if err != nil {
+				return nil, err
+			}
+			bytes, err := buf.ToByteSlice(int(s))
+			if err != nil {
+				return nil, err
+			}
+			directory.Symlinks = append(directory.Symlinks, &remoteexecution.SymlinkNode{
+				Name:   name,
+				Target: hex.EncodeToString(bytes),
+			})
+		} else {
+			return nil, fmt.Errorf("unknown tag %v", blobType)
+		}
+	}
+	return &directory, nil
+}
+
 func (df *blobAccessDirectoryFetcher) GetDirectory(ctx context.Context, directoryDigest digest.Digest) (*remoteexecution.Directory, error) {
 	x := df.blobAccess.Get(ctx, directoryDigest)
 	if directoryDigest.GetDigestFunction().GetEnumValue() == remoteexecution.DigestFunction_GITSHA1 {
@@ -42,7 +97,7 @@ func (df *blobAccessDirectoryFetcher) GetDirectory(ctx context.Context, director
 		if err != nil {
 			return nil, err
 		}
-		m, err := justbuild.ToDirectoryMessage(data)
+		m, err := df.toDirectoryMessage(ctx, data)
 		if err != nil {
 			return nil, err
 		}
