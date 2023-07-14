@@ -428,6 +428,25 @@ func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPat
 			}
 		case filesystem.FileTypeSymlink:
 			if target, err := d.Readlink(name); err == nil {
+				if useGITSHA1 {
+					byteSlice := []byte(target)
+					buf := buffer.NewValidatedBufferFromByteSlice(byteSlice)
+					gen := s.digestFunction.NewGenerator(int64(len(byteSlice)))
+					_, err = gen.Write(byteSlice)
+					if err != nil {
+						return nil, err, nil
+					}
+					linkDgst := gen.Sum()
+					if err != nil {
+						return nil, err, nil
+					}
+					err = s.contentAddressableStorage.Put(s.context, linkDgst, buf)
+					if err != nil {
+						return nil, err, nil
+					}
+					entries = append(entries, []byte(fmt.Sprintf("%o %s\x00%s", 0o120000, name.String(), untagHash(linkDgst.GetHashBytes())))...)
+					continue
+				}
 				directory.Symlinks = append(directory.Symlinks, &remoteexecution.SymlinkNode{
 					Name:   name.String(),
 					Target: target,
@@ -450,11 +469,13 @@ func (s *uploadOutputDirectoryState) uploadDirectory(d UploadableDirectory, dPat
 		if !missing.Empty() {
 			x := buffer.NewCASBufferFromByteSlice(treeDigest, entries, buffer.BackendProvided(func(dataIsValid bool) {
 				if !dataIsValid {
-					fmt.Printf("Could create buffer for git tree %#v\n", treeDigest)
+					fmt.Printf("Could not create buffer for git tree %#v\n", treeDigest)
 				}
 			}))
 
-			s.contentAddressableStorage.Put(s.context, treeDigest, x)
+			if err = s.contentAddressableStorage.Put(s.context, treeDigest, x); err != nil {
+				return nil, err, nil
+			}
 		}
 		return nil, nil, &treeDigest
 	}
