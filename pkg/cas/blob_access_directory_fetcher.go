@@ -2,7 +2,6 @@ package cas
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 
@@ -81,7 +80,7 @@ func (df *blobAccessDirectoryFetcher) toDirectoryMessage(ctx context.Context, en
 			}
 			directory.Symlinks = append(directory.Symlinks, &remoteexecution.SymlinkNode{
 				Name:   name,
-				Target: hex.EncodeToString(bytes),
+				Target: string(bytes),
 			})
 		} else {
 			return nil, fmt.Errorf("unknown tag %v", blobType)
