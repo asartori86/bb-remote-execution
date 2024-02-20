@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"time"
 
@@ -59,6 +60,9 @@ func main() {
 			if err != nil {
 				return util.StatusWrap(err, "Failed to create chrooted command creator")
 			}
+		} else if len(configuration.Launcher) > 0 {
+			log.Printf("launcher: %#v", configuration.Launcher)
+			commandCreator = runner.NewLauncherCommandCreator(sysProcAttr, configuration.Launcher)
 		} else {
 			commandCreator = runner.NewPlainCommandCreator(sysProcAttr)
 		}

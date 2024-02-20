@@ -99,6 +99,18 @@ func NewPlainCommandCreator(sysProcAttr *syscall.SysProcAttr) CommandCreator {
 	}
 }
 
+// NewLauncherCommandCreator returns a CommandCreator where the arguments are
+// prepended with a launcher. This can be useful, for example, to test
+// reproducible builds using libfaketime, disorderfs, ...
+func NewLauncherCommandCreator(sysProcAttr *syscall.SysProcAttr, launcher []string) CommandCreator {
+	return func(ctx context.Context, arguments []string, inputRootDirectory *path.Builder) (*exec.Cmd, *path.Builder) {
+		extendedCmd := append(launcher, arguments...)
+		cmd := exec.CommandContext(ctx, extendedCmd[0], extendedCmd[1:]...)
+		cmd.SysProcAttr = sysProcAttr
+		return cmd, inputRootDirectory
+	}
+}
+
 // NewLocalRunner returns a Runner capable of running commands on the
 // local system directly.
 func NewLocalRunner(buildDirectory filesystem.Directory, buildDirectoryPath *path.Builder, commandCreator CommandCreator, setTmpdirEnvironmentVariable bool) runner.RunnerServer {

@@ -131,4 +131,8 @@ message ApplicationConfiguration {
   // https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/exec/local/XcodeLocalEnvProvider.java
   // https://www.smileykeith.com/2021/03/08/locking-xcode-in-bazel/
   map<string, string> apple_xcode_developer_directories = 14;
+
+  // Launcher to be used to launch the command. This can be useful, for example,
+  // to test reproducible builds using libfaketime, disorderfs, ...
+  repeated string launcher = 15;
 }
